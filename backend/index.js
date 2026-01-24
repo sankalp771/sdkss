@@ -389,6 +389,101 @@ app.get('/api/components', async (req, res) => {
 
 
 /**
+ * SafeBox Details API - Lightweight endpoint for SDK
+ * GET /api/safeBoxDetails?project_id=...&app_version=...
+ * Returns ONLY non-active (faulty) components grouped by version
+ * Filters: status != 'active' OR crashRate > 5%
+ */
+app.get('/api/safeBoxDetails', async (req, res) => {
+  const { project_id, api_key, app_version } = req.query;
+
+  try {
+    let projectId = project_id;
+    
+    if (api_key && !project_id) {
+      const project = await prisma.project.findUnique({ where: { apiKey: api_key } });
+      if (!project) return res.status(404).json({ error: "Project not found" });
+      projectId = project.id;
+    }
+
+    if (!projectId) {
+      return res.status(400).json({ error: "Missing project_id or api_key" });
+    }
+
+    // Get all components for this project
+    const components = await prisma.component.findMany({
+      where: { projectId },
+      include: {
+        versionStats: true
+      }
+    });
+
+    // Get current app version
+    const appUtil = await prisma.applicationUtil.findUnique({
+      where: { projectId }
+    });
+
+    const currentAppVersion = appUtil?.currentAppVersion || 'unknown';
+
+    // Group faulty safeboxes by version
+    const safeBoxesByVersion = {};
+
+    // Process each component and version combination
+    components.forEach(comp => {
+      // Get all versions for this component
+      const versionsToProcess = app_version 
+        ? comp.versionStats.filter(v => v.appVersion === app_version)
+        : comp.versionStats;
+
+      versionsToProcess.forEach(versionStat => {
+        const version = versionStat.appVersion;
+        
+        // Use crash count directly from DB (threshold: > 2 crashes)
+        const crashCount = versionStat.crashCount;
+        const hasHighCrashCount = crashCount > 2;
+
+        // Only include if status is NOT 'active' OR crashCount > 2
+        const isNotActive = comp.status !== 'active';
+        
+        if (isNotActive || hasHighCrashCount) {
+          if (!safeBoxesByVersion[version]) {
+            safeBoxesByVersion[version] = [];
+          }
+
+          safeBoxesByVersion[version].push({
+            id: comp.id,
+            identifier: comp.identifier,
+            status: comp.status,
+            fallbackMessage: comp.fallbackMessage,
+            crashCount: crashCount,
+            totalCrashCount: comp.totalCrashCount
+          });
+        }
+      });
+    });
+
+    // Calculate summary statistics
+    const summary = {
+      totalFaultyComponents: Object.values(safeBoxesByVersion).reduce((sum, arr) => sum + arr.length, 0),
+      versionsWithIssues: Object.keys(safeBoxesByVersion).length
+    };
+
+    res.json({
+      project_id: projectId,
+      currentAppVersion: currentAppVersion,
+      timestamp: new Date().toISOString(),
+      summary,
+      safeBoxesByVersion: Object.keys(safeBoxesByVersion).length > 0 
+        ? safeBoxesByVersion 
+        : {}
+    });
+  } catch (error) {
+    console.error("SafeBox Details Error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
  * 4. Register Component (SDK Initialization)
  */
 app.post('/api/register-component', async (req, res) => {
