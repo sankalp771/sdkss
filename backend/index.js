@@ -875,6 +875,12 @@ async function pollSentryIssues() {
             data: { analysisStatus: 'completed', geminiAnalysis: analysis }
           });
           console.log(`   ✅ Analyzed & Saved (ID: ${newCrash.id}, Action: ${actionId})`);
+
+          // Auto-process crash to extract actionId and create ComponentError
+          console.log(`   🔄 Auto-processing crash ${newCrash.id}...`);
+          processCrash(newCrash.id).catch(err => {
+            console.error(`   ⚠️ Auto-processing failed: ${err.message}`);
+          });
         });
       }
     }
@@ -888,7 +894,36 @@ async function pollSentryIssues() {
   }
 }
 
+
 const { createFixPR } = require('./crash-fixer');
+const { processCrash, processAllUnprocessedCrashes } = require('./crash-processor');
+
+// NEW: Endpoint to Process a Single Crash (Extract ActionId)
+app.post('/api/crashes/:id/process', async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const result = await processCrash(parseInt(id));
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// NEW: Endpoint to Process All Unprocessed Crashes
+app.post('/api/crashes/process-all', async (req, res) => {
+  try {
+    const results = await processAllUnprocessedCrashes();
+    res.json({
+      total: results.length,
+      successful: results.filter(r => r.success).length,
+      failed: results.filter(r => !r.success).length,
+      results
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
 // NEW: Endpoint to Trigger Auto-Fix PR
 app.post('/api/crashes/:id/fix', async (req, res) => {
