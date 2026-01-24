@@ -7,3 +7,5 @@ coverage/
 .vscode/
 backend/service-account.json
 backend/auto-pr*.js
+backend/extracted_stack.txt
+backend/sentry_response.json

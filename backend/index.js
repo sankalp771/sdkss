@@ -17,37 +17,23 @@ const BIGQUERY_DATASET = process.env.BIGQUERY_DATASET || 'firebase_crashlytics';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
 // --- Database Connections ---
-
-// 1. Prisma (Application State)
 const prisma = new PrismaClient();
-
-// 2. Gemini AI (The Brain)
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
 // --- Routes ---
-
-// Health Check
 app.get('/', (req, res) => {
   res.send('CrashGuard Backend is Active 🟢 (Simulation Mode)');
 });
 
 /**
  * 1. Report Crash (Direct from SDK)
- * Since we cannot pull from Crashlytics without BigQuery, the SDK sends the crash
- * directly to us at the same time it sends to Firebase.
  */
 app.post('/api/report-crash', async (req, res) => {
   const { project_id, component_id, error_message, stack_trace, metadata } = req.body;
 
   try {
     console.log(`🚨 Received Crash Report for Component: ${component_id}`);
-
-    // Validate Project
-    // const project = await prisma.project.findFirst({ where: { id: project_id } }); 
-    // if (!project) return res.status(404).json({ error: "Invalid Project" });
-
-    // Find Component (optional validation)
     const comp = await prisma.component.findUnique({
       where: { projectId_identifier: { projectId: project_id, identifier: component_id } }
     });
@@ -55,18 +41,15 @@ app.post('/api/report-crash', async (req, res) => {
     const crashData = {
       projectId: project_id,
       componentId: comp ? comp.id : null,
-      firebaseEventId: `direct-${Date.now()}`, // Generated locally since it's direct
+      firebaseEventId: `direct-${Date.now()}`,
       errorMessage: error_message,
       stackTrace: stack_trace,
       analysisStatus: 'pending',
       geminiAnalysis: {}
     };
 
-    // 1. Store in DB
     const newCrash = await prisma.processedCrash.create({ data: crashData });
 
-    // 2. Trigger Gemini Analysis immediately
-    // We do this asynchronously so we don't block the client response
     analyzeCrashInternal(error_message, stack_trace, component_id).then(async (analysis) => {
       await prisma.processedCrash.update({
         where: { id: newCrash.id },
@@ -86,7 +69,6 @@ app.post('/api/report-crash', async (req, res) => {
   }
 });
 
-// Helper Function for Internal Analysis
 async function analyzeCrashInternal(msg, stack, context) {
   try {
     const prompt = `
@@ -104,45 +86,24 @@ async function analyzeCrashInternal(msg, stack, context) {
   }
 }
 
-
 /**
  * 2. Sentry Webhook Receiver
- * Listens for 'issue.created' events from Sentry.
  */
 app.post('/api/sentry-webhook', async (req, res) => {
   try {
     const event = req.body;
+    const issue = event.data?.issue || event.issue;
+    if (!issue) return res.status(200).send("No issue data found, ignoring.");
 
-    // We only care about specific triggers, e.g., a new issue is created
-    // Sentry payload structure depends on the triggers selected in the integration
-    // Usually: { action: 'created', data: { issue: { ... } } }
-
-    // Log raw hook for debugging (remove in prod)
-    // console.log("Sentry Hook:", JSON.stringify(event, null, 2));
-
-    const issue = event.data?.issue || event.issue; // Handle different payload shapes
-    if (!issue) {
-      return res.status(200).send("No issue data found, ignoring.");
-    }
-
-    const error_message = issue.title; // e.g. "TypeError: Payment failed"
-    const stack_trace = issue.culprit; // e.g. "ui/payments.js in checkout"
+    const error_message = issue.title;
+    const stack_trace = issue.culprit;
     const sentry_url = issue.permalink;
 
-    // We might not have 'component_id' directly from Sentry unless sent as a tag.
-    // Hackathon Fix: We try to regex match the component name from the stack trace
-    // OR we default to a 'General' component or try to look up tags.
-    // For now, let's look for tags if available, or fallback.
-
-    // const componentTag = event.data.event.tags.find(t => t.key === 'componentId');
-    // const component_id = componentTag ? componentTag.value : 'unknown_component';
-
-    // For MVP Demo: Just store it as 'External Sentry Issue'
     console.log(`🚨 Sentry Alert: ${error_message}`);
 
     const crashData = {
-      projectId: "41ed4c1c-683d-4ccc-a526-0d8cb7a015c8", // Default to Demo Project
-      componentId: null, // Sentry doesn't map 1:1 to our DB components easily without tags
+      projectId: "41ed4c1c-683d-4ccc-a526-0d8cb7a015c8",
+      componentId: null,
       firebaseEventId: `sentry-${issue.id}`,
       errorMessage: error_message,
       stackTrace: stack_trace || "View Sentry Link for Stack",
@@ -150,10 +111,8 @@ app.post('/api/sentry-webhook', async (req, res) => {
       geminiAnalysis: { note: "Imported from Sentry", link: sentry_url }
     };
 
-    // 1. Store in DB
     const newCrash = await prisma.processedCrash.create({ data: crashData });
 
-    // 2. Trigger Gemini Analysis 
     analyzeCrashInternal(error_message, stack_trace, "Sentry Context").then(async (analysis) => {
       await prisma.processedCrash.update({
         where: { id: newCrash.id },
@@ -169,48 +128,7 @@ app.post('/api/sentry-webhook', async (req, res) => {
 
   } catch (error) {
     console.error('Sentry Hook Error:', error);
-    // Always return 200 to Sentry or they will retry spam you
     res.status(200).json({ error: error.message });
-  }
-});
-
-/**
- * 2. Analyze a Specific Crash with Gemini
- */
-app.post('/api/analyze-crash', async (req, res) => {
-  const { error_message, stack_trace, component_context } = req.body;
-
-  if (!error_message) return res.status(400).json({ error: 'Missing error_message' });
-
-  try {
-    const prompt = `
-      You are an expert React Native and Web Debugging Assistant.
-      Analyze the following crash report and suggest a fix.
-      
-      Context: ${component_context || 'Unknown Component'}
-      Error: ${error_message}
-      Stack Trace:
-      ${stack_trace}
-
-      Provide your response in JSON format:
-      {
-        "root_cause": "Brief explanation",
-        "suggested_fix": "Code snippet or logic change",
-        "severity": "High/Medium/Low",
-        "safe_to_render_fallback": true/false
-      }
-    `;
-
-    const result = await model.generateContent(prompt);
-    const response = await result.response;
-    const text = response.text();
-    const cleanJson = text.replace(/```json/g, '').replace(/```/g, '');
-
-    res.json(JSON.parse(cleanJson));
-
-  } catch (error) {
-    console.error('Gemini Analysis Error:', error);
-    res.status(500).json({ error: error.message });
   }
 });
 
@@ -218,29 +136,24 @@ app.post('/api/analyze-crash', async (req, res) => {
  * 3. Component Status (SDK Polling Endpoint)
  */
 app.get('/api/component-status', async (req, res) => {
-  const { project_id, component_ids } = req.query; // Expect comma-separated IDs
+  const { project_id, component_ids } = req.query;
 
   if (!project_id || !component_ids) {
     return res.status(400).json({ error: 'Missing params' });
   }
 
   const ids = component_ids.split(',');
+  let responseData = {};
 
   try {
-    // 1. Fetch current status from DB
     const components = await prisma.component.findMany({
       where: {
         projectId: project_id,
         identifier: { in: ids }
       },
-      select: {
-        identifier: true,
-        status: true,
-        fallbackMessage: true
-      }
+      select: { identifier: true, status: true, fallbackMessage: true }
     });
 
-    // Default to 'active' if not found
     ids.forEach(id => {
       const found = components.find(c => c.identifier === id);
       responseData[id] = {
@@ -253,13 +166,8 @@ app.get('/api/component-status', async (req, res) => {
 
   } catch (error) {
     console.warn("⚠️ DB Unreachable, serving Default 'Active' Status:", error.message);
-    // Fallback: All active
     const fallbackData = {};
-    if (ids) {
-      ids.forEach(id => {
-        fallbackData[id] = { status: 'active', fallback_message: null };
-      });
-    }
+    if (ids) ids.forEach(id => fallbackData[id] = { status: 'active', fallback_message: null });
     res.json(fallbackData);
   }
 });
@@ -274,7 +182,7 @@ app.get('/api/components', async (req, res) => {
 
   try {
     let projectId = project_id;
-    
+
     if (api_key && !project_id) {
       // Look up project by key
       const project = await prisma.project.findUnique({ where: { apiKey: api_key } });
@@ -310,14 +218,14 @@ app.get('/api/components', async (req, res) => {
 
     // Build optimized response
     const componentsByVersion = {};
-    
+
     components.forEach(comp => {
-      const versionStats = app_version 
+      const versionStats = app_version
         ? comp.versionStats.find(v => v.appVersion === app_version)
         : comp.versionStats[0]; // Default to latest
-      
+
       const safeVersion = app_version || appUtil?.currentAppVersion || 'unknown';
-      
+
       if (!componentsByVersion[safeVersion]) {
         componentsByVersion[safeVersion] = [];
       }
@@ -334,7 +242,7 @@ app.get('/api/components', async (req, res) => {
           appVersion: versionStats.appVersion,
           crashCount: versionStats.crashCount,
           actionCount: versionStats.actionCount,
-          crashRate: versionStats.actionCount > 0 
+          crashRate: versionStats.actionCount > 0
             ? ((versionStats.crashCount / versionStats.actionCount) * 100).toFixed(2) + '%'
             : '0%',
           lastUpdated: versionStats.lastUpdated
@@ -399,7 +307,7 @@ app.get('/api/safeBoxDetails', async (req, res) => {
 
   try {
     let projectId = project_id;
-    
+
     if (api_key && !project_id) {
       const project = await prisma.project.findUnique({ where: { apiKey: api_key } });
       if (!project) return res.status(404).json({ error: "Project not found" });
@@ -431,20 +339,20 @@ app.get('/api/safeBoxDetails', async (req, res) => {
     // Process each component and version combination
     components.forEach(comp => {
       // Get all versions for this component
-      const versionsToProcess = app_version 
+      const versionsToProcess = app_version
         ? comp.versionStats.filter(v => v.appVersion === app_version)
         : comp.versionStats;
 
       versionsToProcess.forEach(versionStat => {
         const version = versionStat.appVersion;
-        
+
         // Use crash count directly from DB (threshold: > 2 crashes)
         const crashCount = versionStat.crashCount;
         const hasHighCrashCount = crashCount > 2;
 
         // Only include if status is NOT 'active' OR crashCount > 2
         const isNotActive = comp.status !== 'active';
-        
+
         if (isNotActive || hasHighCrashCount) {
           if (!safeBoxesByVersion[version]) {
             safeBoxesByVersion[version] = [];
@@ -473,8 +381,8 @@ app.get('/api/safeBoxDetails', async (req, res) => {
       currentAppVersion: currentAppVersion,
       timestamp: new Date().toISOString(),
       summary,
-      safeBoxesByVersion: Object.keys(safeBoxesByVersion).length > 0 
-        ? safeBoxesByVersion 
+      safeBoxesByVersion: Object.keys(safeBoxesByVersion).length > 0
+        ? safeBoxesByVersion
         : {}
     });
   } catch (error) {
@@ -562,8 +470,8 @@ app.post('/api/report-error', async (req, res) => {
       }
     });
 
-    res.json({ 
-      status: 'recorded', 
+    res.json({
+      status: 'recorded',
       error_id: error.id,
       version_stat: versionStat
     });
@@ -768,7 +676,6 @@ app.post('/api/archive-errors', async (req, res) => {
 
 /**
  * 5. Static Config Endpoint (Requested)
- * Useful for simple feature flag / blocking checks
  */
 app.get('/api/config', (req, res) => {
   res.json({
@@ -784,81 +691,194 @@ app.get('/api/config', (req, res) => {
 
 // --- Sentry Polling Service (Bypasses Ngrok) ---
 // DISABLED BY DEFAULT - Enable only if you have a valid project in the database
-const SENTRY_ENABLED = process.env.SENTRY_POLLING_ENABLED === 'true'; // Set to true in .env to enable
-const SENTRY_AUTH_TOKEN = "018d1a0ddcdc56b902fbdf1e12463c1df15d45a000291708f8210034cfce04eb";
-const ORG_SLUG = "sankalp-lk"; // Deduced from your screenshots
-const PROJECT_SLUG = "open-safe-box"; // Default Flutter project name seen in screenshot
+const SENTRY_ENABLED = process.env.SENTRY_POLLING_ENABLED === 'true' || true; // Default to true for demo
+const SENTRY_AUTH_TOKEN = process.env.SENTRY_AUTH_TOKEN;
+const ORG_SLUG = "sankalp-lk";
+const PROJECT_SLUG = "open-safe-box";
+
 
 async function pollSentryIssues() {
-  if (!SENTRY_ENABLED) {
-    return; // Polling disabled
-  }
-
   try {
-    // console.log("🕵️ Polling Sentry for new issues...");
     const url = `https://sentry.io/api/0/projects/${ORG_SLUG}/${PROJECT_SLUG}/issues/?query=is:unresolved`;
 
-    const response = await axios.get(url, {
-      headers: { Authorization: `Bearer ${SENTRY_AUTH_TOKEN}` }
-    });
-
+    const response = await axios.get(url, { headers: { Authorization: `Bearer ${SENTRY_AUTH_TOKEN}` } });
     const issues = response.data;
-    // console.log(`   - Found ${issues.length} unresolved issues.`);
 
     for (const issue of issues) {
-      try {
-        // Check if we already have this crash
-        const exists = await prisma.processedCrash.findFirst({
-          where: { firebaseEventId: `sentry-${issue.id}` }
+      const exists = await prisma.processedCrash.findFirst({
+        where: { firebaseEventId: `sentry-${issue.id}` }
+      });
+
+      if (!exists) {
+        console.log(`🔥 New Sentry Issue Found: ${issue.title}`);
+
+        let fullStackTrace = issue.culprit;
+        let actionId = null;
+        let componentFile = null;
+
+        try {
+          // Fetch FULL DETAILS
+          const eventUrl = `https://sentry.io/api/0/issues/${issue.id}/events/latest/`;
+          const eventRes = await axios.get(eventUrl, { headers: { Authorization: `Bearer ${SENTRY_AUTH_TOKEN}` } });
+          const eventData = eventRes.data;
+
+          // 1. Extract Stack Trace (Try multiple paths)
+          try {
+            let values = [];
+            // Path A: Top level exception
+            if (eventData.exception && eventData.exception.values) {
+              values = eventData.exception.values;
+            }
+            // Path B: Inside entries array
+            else if (eventData.entries) {
+              const excEntry = eventData.entries.find(e => e.type === 'exception');
+              if (excEntry && excEntry.data && excEntry.data.values) {
+                values = excEntry.data.values;
+              }
+            }
+
+            if (values.length > 0) {
+              fullStackTrace = values.map(val => {
+                const header = `${val.type}: ${val.value}\n`;
+                const frames = (val.stacktrace && val.stacktrace.frames)
+                  ? val.stacktrace.frames.map(f => {
+                    const func = f.function || '<anonymous>';
+                    const file = f.filename || 'unknown';
+                    const pkg = f.package ? ` within ${f.package}` : '';
+                    // Match Sentry UI format
+                    return `${file} in ${func} at line ${f.lineNo}:${f.colNo}${pkg}`;
+                  }).reverse().join('\n')
+                  : '  (No frames available)';
+                return header + frames;
+              }).join('\n\n');
+
+              // Try to find file from frames (skip system files)
+              const allFrames = values.flatMap(v => v.stacktrace?.frames || []);
+              // Reverse to look from top of stack down
+              const reversedFrames = [...allFrames].reverse();
+              const systemFiles = ['errors.dart', 'zone.dart', 'isolate_helper.dart', 'future.dart'];
+
+              // 1. Try to find last 'inApp' frame that isn't a system file
+              // (Note: Sentry marks some system files as inside app sometimes in debug builds)
+              let topFrame = reversedFrames.find(f =>
+                f.filename && f.filename.includes('.dart') && !systemFiles.includes(f.filename)
+              );
+
+              // 2. Fallback to any dart file if no user file found
+              if (!topFrame) {
+                topFrame = reversedFrames.find(f => f.filename && f.filename.includes('.dart'));
+              }
+
+              if (topFrame) componentFile = topFrame.filename;
+            } else {
+              // Path C: Fallback to raw text message if no stack found
+              console.log("   ⚠️ No structured stacktrace found in event data. Using raw message.");
+              fullStackTrace = `Raw Message: ${eventData.message}\n` + (issue.culprit || '');
+            }
+          } catch (stackErr) {
+            console.log("   ⚠️ Stack parsing error:", stackErr.message);
+          }
+
+          // 2. Extract Action ID
+          // Strategy A: Tags
+          if (eventData.tags) {
+            const actionTag = eventData.tags.find(t => t.key === 'actionId' || t.key === 'action_id');
+            if (actionTag) actionId = actionTag.value;
+          }
+
+          // Strategy B: Breadcrumbs (Logs)
+          if (!actionId && eventData.entries) {
+            const breadcrumbEntry = eventData.entries.find(e => e.type === 'breadcrumbs');
+            if (breadcrumbEntry && breadcrumbEntry.data && breadcrumbEntry.data.values) {
+              // Look for logs like "[ActionGuard] ... actionId=xyz"
+              // or just any key-value pair in messages
+              for (const b of breadcrumbEntry.data.values) {
+                if (b.message && b.message.includes('actionId=')) {
+                  const match = b.message.match(/actionId=([^|\s]+)/);
+                  if (match) actionId = match[1];
+                }
+              }
+            }
+          }
+
+          // Strategy C: Regex on Stack Trace
+          if (!actionId) {
+            const match = fullStackTrace.match(/actionId:\s*['"](.+?)['"]/);
+            if (match) actionId = match[1];
+          }
+
+        } catch (detailsErr) {
+          console.log("   ⚠️ Could not fetch details, using summary.", detailsErr);
+        }
+
+        const newCrash = await prisma.processedCrash.create({
+          data: {
+            projectId: "41ed4c1c-683d-4ccc-a526-0d8cb7a015c8",
+            componentId: actionId || "unknown_component",
+            firebaseEventId: `sentry-${issue.id}`,
+            errorMessage: issue.title,
+            stackTrace: fullStackTrace,
+            analysisStatus: 'pending',
+            geminiAnalysis: {
+              source: "Sentry Poller",
+              link: issue.permalink,
+              guessedFile: componentFile
+            }
+          }
         });
 
-        if (!exists) {
-          console.log(`🔥 New Sentry Issue Found: ${issue.title}`);
-
-          // Verify project exists
-          const project = await prisma.project.findUnique({
-            where: { id: "41ed4c1c-683d-4ccc-a526-0d8cb7a015c8" }
+        analyzeCrashInternal(
+          issue.title,
+          fullStackTrace,
+          `Sentry Imported. ActionID: ${actionId || 'None'}. File: ${componentFile || 'Unknown'}`
+        ).then(async (analysis) => {
+          await prisma.processedCrash.update({
+            where: { id: newCrash.id },
+            data: { analysisStatus: 'completed', geminiAnalysis: analysis }
           });
-
-          if (project) {
-            // Import into DB
-            const newCrash = await prisma.processedCrash.create({
-              data: {
-                projectId: "41ed4c1c-683d-4ccc-a526-0d8cb7a015c8",
-                componentId: null,
-                firebaseEventId: `sentry-${issue.id}`,
-                errorMessage: issue.title,
-                stackTrace: issue.culprit, // Sentry provides partial stack in list view
-                analysisStatus: 'pending',
-                geminiAnalysis: { source: "Sentry Poller", link: issue.permalink }
-              }
-            });
-
-            // Analyze
-            analyzeCrashInternal(issue.title, issue.culprit, "Sentry Imported").then(async (analysis) => {
-              await prisma.processedCrash.update({
-                where: { id: newCrash.id },
-                data: { analysisStatus: 'completed', geminiAnalysis: analysis }
-              });
-              console.log(`   ✅ Analyzed & Saved (ID: ${newCrash.id})`);
-            }).catch(err => console.error("Analysis error:", err.message));
-          }
-        }
-      } catch (issueError) {
-        console.error(`Error processing Sentry issue ${issue.id}:`, issueError.message);
+          console.log(`   ✅ Analyzed & Saved (ID: ${newCrash.id}, Action: ${actionId})`);
+        });
       }
     }
 
   } catch (error) {
     if (error.response?.status === 404) {
       console.warn("⚠️ Sentry Polling 404: Check Organization/Project Slugs!");
-    } else if (error.message.includes('ECONNREFUSED')) {
-      console.warn("⚠️ Sentry service unreachable");
     } else {
-      console.error("⚠️ Sentry Polling Error:", error.message);
+      console.error("❌ Sentry Polling Error:", error);
     }
   }
 }
+
+const { createFixPR } = require('./crash-fixer');
+
+// NEW: Endpoint to Trigger Auto-Fix PR
+app.post('/api/crashes/:id/fix', async (req, res) => {
+  const { id } = req.params;
+  const crash = await prisma.processedCrash.findUnique({ where: { id: parseInt(id) } });
+
+  if (!crash) return res.status(404).json({ error: "Crash not found" });
+  if (!crash.geminiAnalysis) return res.status(400).json({ error: "Analysis not ready yet" });
+
+  // Use the guessed file from analysis, or 'lib/main.dart' default
+  // Note: Gemini sometimes returns JSON string in the analysis field, ensure it's parsed or handled.
+  let targetFile = "lib/main.dart";
+  if (typeof crash.geminiAnalysis === 'object' && crash.geminiAnalysis.guessedFile) {
+    targetFile = crash.geminiAnalysis.guessedFile;
+  }
+
+  console.log(`🚀 Triggering Fix for Crash #${id} in ${targetFile}`);
+
+  // Trigger Background Process (async)
+  createFixPR(crash.id, crash.errorMessage, crash.stackTrace, targetFile)
+    .then(result => {
+      console.log(`   ✅ Fix Result for #${id}:`, result);
+      // TODO: Update DB with PR ID/Link
+    })
+    .catch(err => console.error(`   ❌ Fix Error for #${id}:`, err));
+
+  res.json({ message: "Fix triggered! Check GitHub PRs shortly." });
+});
 
 // Start Polling Loop (Every 30 Seconds) - only if enabled
 if (SENTRY_ENABLED) {
