@@ -265,36 +265,122 @@ app.get('/api/component-status', async (req, res) => {
 });
 
 /**
- * 4. List All Components (Admin & Debug)
- * GET /api/components?project_id=...
+ * 4. List All Components (Admin & Debug) - OPTIMIZED
+ * GET /api/components?project_id=...&app_version=...
+ * Returns detailed component status with version-specific metrics
  */
 app.get('/api/components', async (req, res) => {
-  const { project_id, api_key } = req.query;
+  const { project_id, api_key, app_version } = req.query;
 
   try {
-    let whereClause = {};
-    if (project_id) {
-      whereClause.projectId = project_id;
-    } else if (api_key) {
+    let projectId = project_id;
+    
+    if (api_key && !project_id) {
       // Look up project by key
       const project = await prisma.project.findUnique({ where: { apiKey: api_key } });
       if (!project) return res.status(404).json({ error: "Project not found" });
-      whereClause.projectId = project.id;
-    } else {
-      // For hackathon simplicity, if no param, just return EVERYTHING (or limiting to first project)
-      // return res.status(400).json({ error: "Missing project_id or api_key" });
+      projectId = project.id;
     }
 
+    if (!projectId) {
+      return res.status(400).json({ error: "Missing project_id or api_key" });
+    }
+
+    // Fetch all components for this project with their stats
     const components = await prisma.component.findMany({
-      where: whereClause,
+      where: { projectId },
       include: {
+        versionStats: true,
+        componentErrors: {
+          where: { isArchived: false },
+          orderBy: { createdAt: 'desc' },
+          take: 5 // Last 5 errors
+        },
         _count: {
-          select: { processedCrashes: true }
+          select: { processedCrashes: true, componentErrors: true }
         }
-      }
+      },
+      orderBy: { createdAt: 'asc' }
     });
 
-    res.json(components);
+    // Fetch app config
+    const appUtil = await prisma.applicationUtil.findUnique({
+      where: { projectId }
+    });
+
+    // Build optimized response
+    const componentsByVersion = {};
+    
+    components.forEach(comp => {
+      const versionStats = app_version 
+        ? comp.versionStats.find(v => v.appVersion === app_version)
+        : comp.versionStats[0]; // Default to latest
+      
+      const safeVersion = app_version || appUtil?.currentAppVersion || 'unknown';
+      
+      if (!componentsByVersion[safeVersion]) {
+        componentsByVersion[safeVersion] = [];
+      }
+
+      componentsByVersion[safeVersion].push({
+        id: comp.id,
+        identifier: comp.identifier,
+        name: comp.name,
+        status: comp.status,
+        fallbackMessage: comp.fallbackMessage,
+        totalCrashCount: comp.totalCrashCount,
+        crashThreshold: comp.crashThreshold,
+        versionMetrics: versionStats ? {
+          appVersion: versionStats.appVersion,
+          crashCount: versionStats.crashCount,
+          actionCount: versionStats.actionCount,
+          crashRate: versionStats.actionCount > 0 
+            ? ((versionStats.crashCount / versionStats.actionCount) * 100).toFixed(2) + '%'
+            : '0%',
+          lastUpdated: versionStats.lastUpdated
+        } : {
+          appVersion: safeVersion,
+          crashCount: 0,
+          actionCount: 0,
+          crashRate: '0%',
+          lastUpdated: comp.updatedAt
+        },
+        recentErrors: comp.componentErrors.map(err => ({
+          id: err.id,
+          actionId: err.actionId,
+          errorMessage: err.errorMessage,
+          errorType: err.errorType,
+          timestamp: err.createdAt,
+          appVersion: err.appVersion
+        })),
+        errorCount: comp._count.componentErrors,
+        processedCrashCount: comp._count.processedCrashes,
+        createdAt: comp.createdAt,
+        updatedAt: comp.updatedAt
+      });
+    });
+
+    // Final response structure
+    const response = {
+      project: {
+        id: projectId,
+        appVersion: app_version || appUtil?.currentAppVersion || 'unknown',
+        minSupportedVersion: appUtil?.minSupportedVersion || 'unknown',
+        metadata: appUtil?.metadata || {}
+      },
+      timestamp: new Date().toISOString(),
+      componentsCount: components.length,
+      componentsByVersion,
+      summary: {
+        totalComponents: components.length,
+        activeComponents: components.filter(c => c.status === 'active').length,
+        maintenanceComponents: components.filter(c => c.status === 'maintenance').length,
+        deprecatedComponents: components.filter(c => c.status === 'deprecated').length,
+        totalErrors: components.reduce((sum, c) => sum + c._count.componentErrors, 0)
+      }
+    };
+
+    res.json(response);
   } catch (error) {
     console.error("Fetch Components Error:", error);
     res.status(500).json({ error: error.message });
@@ -332,6 +418,260 @@ app.post('/api/register-component', async (req, res) => {
 
 
 /**
+ * 5. Report Component Error (SDK)
+ * POST /api/report-error
+ * Logs detailed error with action context
+ */
+app.post('/api/report-error', async (req, res) => {
+  const { project_id, component_id, action_id, app_version, error_message, error_type, stack_trace, metadata } = req.body;
+
+  try {
+    // Find component
+    const component = await prisma.component.findUnique({
+      where: { projectId_identifier: { projectId: project_id, identifier: component_id } }
+    });
+
+    if (!component) {
+      return res.status(404).json({ error: "Component not found" });
+    }
+
+    // Create error record
+    const error = await prisma.componentError.create({
+      data: {
+        componentId: component.id,
+        projectId: project_id,
+        actionId: action_id,
+        appVersion: app_version,
+        errorMessage: error_message,
+        errorType: error_type,
+        stackTrace: stack_trace,
+        metadata: metadata || {}
+      }
+    });
+
+    // Update component's total crash count
+    await prisma.component.update({
+      where: { id: component.id },
+      data: { totalCrashCount: { increment: 1 } }
+    });
+
+    // Update version-specific stats
+    const versionStat = await prisma.componentVersionStat.upsert({
+      where: { componentId_appVersion: { componentId: component.id, appVersion } },
+      update: { crashCount: { increment: 1 } },
+      create: {
+        componentId: component.id,
+        appVersion,
+        crashCount: 1,
+        actionCount: 0
+      }
+    });
+
+    res.json({ 
+      status: 'recorded', 
+      error_id: error.id,
+      version_stat: versionStat
+    });
+  } catch (error) {
+    console.error('Report Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * 6. Track Action Call (SDK)
+ * POST /api/track-action
+ * Increments action count for version metrics
+ */
+app.post('/api/track-action', async (req, res) => {
+  const { project_id, component_id, app_version } = req.body;
+
+  try {
+    const component = await prisma.component.findUnique({
+      where: { projectId_identifier: { projectId: project_id, identifier: component_id } }
+    });
+
+    if (!component) {
+      return res.status(404).json({ error: "Component not found" });
+    }
+
+    const versionStat = await prisma.componentVersionStat.upsert({
+      where: { componentId_appVersion: { componentId: component.id, appVersion } },
+      update: { actionCount: { increment: 1 } },
+      create: {
+        componentId: component.id,
+        appVersion,
+        crashCount: 0,
+        actionCount: 1
+      }
+    });
+
+    res.json({ status: 'tracked', version_stat: versionStat });
+  } catch (error) {
+    console.error('Track Action Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * 7. Get App Config (ApplicationUtil)
+ * GET /api/app-config?project_id=...
+ */
+app.get('/api/app-config', async (req, res) => {
+  const { project_id } = req.query;
+
+  try {
+    if (!project_id) {
+      return res.status(400).json({ error: "Missing project_id" });
+    }
+
+    const appUtil = await prisma.applicationUtil.findUnique({
+      where: { projectId: project_id }
+    });
+
+    if (!appUtil) {
+      return res.status(404).json({ error: "App config not found" });
+    }
+
+    res.json(appUtil);
+  } catch (error) {
+    console.error('Fetch App Config Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * 8. Update App Config
+ * POST /api/app-config
+ */
+app.post('/api/app-config', async (req, res) => {
+  const { project_id, current_app_version, min_supported_version, metadata } = req.body;
+
+  try {
+    if (!project_id) {
+      return res.status(400).json({ error: "Missing project_id" });
+    }
+
+    const appUtil = await prisma.applicationUtil.upsert({
+      where: { projectId: project_id },
+      update: {
+        currentAppVersion: current_app_version,
+        minSupportedVersion: min_supported_version,
+        metadata: metadata || {}
+      },
+      create: {
+        projectId: project_id,
+        currentAppVersion: current_app_version,
+        minSupportedVersion: min_supported_version,
+        metadata: metadata || {}
+      }
+    });
+
+    res.json({ status: 'updated', appUtil });
+  } catch (error) {
+    console.error('Update App Config Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * 9. Get Error Analytics
+ * GET /api/error-analytics?project_id=...&days=7&component_id=...
+ */
+app.get('/api/error-analytics', async (req, res) => {
+  const { project_id, component_id, days = 7 } = req.query;
+
+  try {
+    const daysAgo = new Date();
+    daysAgo.setDate(daysAgo.getDate() - parseInt(days));
+
+    let whereClause = { projectId: project_id, createdAt: { gte: daysAgo } };
+    if (component_id) {
+      whereClause.componentId = component_id;
+    }
+
+    const errors = await prisma.componentError.findMany({
+      where: whereClause,
+      include: { component: { select: { identifier: true, name: true } } }
+    });
+
+    // Group by version and action
+    const byVersion = {};
+    const byAction = {};
+    const byType = {};
+
+    errors.forEach(err => {
+      // By version
+      if (!byVersion[err.appVersion]) {
+        byVersion[err.appVersion] = 0;
+      }
+      byVersion[err.appVersion]++;
+
+      // By action
+      if (!byAction[err.actionId]) {
+        byAction[err.actionId] = 0;
+      }
+      byAction[err.actionId]++;
+
+      // By error type
+      if (!byType[err.errorType || 'Unknown']) {
+        byType[err.errorType || 'Unknown'] = 0;
+      }
+      byType[err.errorType || 'Unknown']++;
+    });
+
+    res.json({
+      totalErrors: errors.length,
+      timeRange: `${days} days`,
+      analytics: {
+        byVersion,
+        byAction,
+        byErrorType: byType,
+        recentErrors: errors.slice(0, 10)
+      }
+    });
+  } catch (error) {
+    console.error('Error Analytics Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * 10. Archive Old Errors (Weekly Cleanup)
+ * POST /api/archive-errors?days=7
+ * Called by cron job or manually
+ */
+app.post('/api/archive-errors', async (req, res) => {
+  const { days = 7 } = req.query;
+
+  try {
+    const archiveDate = new Date();
+    archiveDate.setDate(archiveDate.getDate() - parseInt(days));
+
+    const result = await prisma.componentError.updateMany({
+      where: {
+        createdAt: { lt: archiveDate },
+        isArchived: false
+      },
+      data: {
+        isArchived: true,
+        archivedAt: new Date()
+      }
+    });
+
+    res.json({
+      status: 'archived',
+      archivedCount: result.count,
+      archiveDate,
+      message: `Archived ${result.count} errors older than ${days} days`
+    });
+  } catch (error) {
+    console.error('Archive Errors Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
  * 5. Static Config Endpoint (Requested)
  * Useful for simple feature flag / blocking checks
  */
@@ -348,11 +688,17 @@ app.get('/api/config', (req, res) => {
 });
 
 // --- Sentry Polling Service (Bypasses Ngrok) ---
+// DISABLED BY DEFAULT - Enable only if you have a valid project in the database
+const SENTRY_ENABLED = process.env.SENTRY_POLLING_ENABLED === 'true'; // Set to true in .env to enable
 const SENTRY_AUTH_TOKEN = "018d1a0ddcdc56b902fbdf1e12463c1df15d45a000291708f8210034cfce04eb";
 const ORG_SLUG = "sankalp-lk"; // Deduced from your screenshots
 const PROJECT_SLUG = "open-safe-box"; // Default Flutter project name seen in screenshot
 
 async function pollSentryIssues() {
+  if (!SENTRY_ENABLED) {
+    return; // Polling disabled
+  }
+
   try {
     // console.log("🕵️ Polling Sentry for new issues...");
     const url = `https://sentry.io/api/0/projects/${ORG_SLUG}/${PROJECT_SLUG}/issues/?query=is:unresolved`;
@@ -365,53 +711,68 @@ async function pollSentryIssues() {
     // console.log(`   - Found ${issues.length} unresolved issues.`);
 
     for (const issue of issues) {
-      // Check if we already have this crash
-      const exists = await prisma.processedCrash.findFirst({
-        where: { firebaseEventId: `sentry-${issue.id}` }
-      });
-
-      if (!exists) {
-        console.log(`🔥 New Sentry Issue Found: ${issue.title}`);
-
-        // Import into DB
-        const newCrash = await prisma.processedCrash.create({
-          data: {
-            projectId: "41ed4c1c-683d-4ccc-a526-0d8cb7a015c8",
-            componentId: null,
-            firebaseEventId: `sentry-${issue.id}`,
-            errorMessage: issue.title,
-            stackTrace: issue.culprit, // Sentry provides partial stack in list view
-            analysisStatus: 'pending',
-            geminiAnalysis: { source: "Sentry Poller", link: issue.permalink }
-          }
+      try {
+        // Check if we already have this crash
+        const exists = await prisma.processedCrash.findFirst({
+          where: { firebaseEventId: `sentry-${issue.id}` }
         });
 
-        // Analyze
-        analyzeCrashInternal(issue.title, issue.culprit, "Sentry Imported").then(async (analysis) => {
-          await prisma.processedCrash.update({
-            where: { id: newCrash.id },
-            data: { analysisStatus: 'completed', geminiAnalysis: analysis }
+        if (!exists) {
+          console.log(`🔥 New Sentry Issue Found: ${issue.title}`);
+
+          // Verify project exists
+          const project = await prisma.project.findUnique({
+            where: { id: "41ed4c1c-683d-4ccc-a526-0d8cb7a015c8" }
           });
-          console.log(`   ✅ Analyzed & Saved (ID: ${newCrash.id})`);
-        });
+
+          if (project) {
+            // Import into DB
+            const newCrash = await prisma.processedCrash.create({
+              data: {
+                projectId: "41ed4c1c-683d-4ccc-a526-0d8cb7a015c8",
+                componentId: null,
+                firebaseEventId: `sentry-${issue.id}`,
+                errorMessage: issue.title,
+                stackTrace: issue.culprit, // Sentry provides partial stack in list view
+                analysisStatus: 'pending',
+                geminiAnalysis: { source: "Sentry Poller", link: issue.permalink }
+              }
+            });
+
+            // Analyze
+            analyzeCrashInternal(issue.title, issue.culprit, "Sentry Imported").then(async (analysis) => {
+              await prisma.processedCrash.update({
+                where: { id: newCrash.id },
+                data: { analysisStatus: 'completed', geminiAnalysis: analysis }
+              });
+              console.log(`   ✅ Analyzed & Saved (ID: ${newCrash.id})`);
+            }).catch(err => console.error("Analysis error:", err.message));
+          }
+        }
+      } catch (issueError) {
+        console.error(`Error processing Sentry issue ${issue.id}:`, issueError.message);
       }
     }
 
   } catch (error) {
     if (error.response?.status === 404) {
       console.warn("⚠️ Sentry Polling 404: Check Organization/Project Slugs!");
+    } else if (error.message.includes('ECONNREFUSED')) {
+      console.warn("⚠️ Sentry service unreachable");
     } else {
       console.error("⚠️ Sentry Polling Error:", error.message);
     }
   }
 }
 
-// Start Polling Loop (Every 30 Seconds)
-setInterval(pollSentryIssues, 30 * 1000);
-pollSentryIssues(); // Run immediately on start
+// Start Polling Loop (Every 30 Seconds) - only if enabled
+if (SENTRY_ENABLED) {
+  setInterval(pollSentryIssues, 30 * 1000);
+  pollSentryIssues(); // Run immediately on start
+}
 
 // Start Server
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
-  console.log(`   - Sentry Poller Active 🟢`);
+  console.log(`   - Sentry Poller: ${SENTRY_ENABLED ? '🟢 Active' : '🔴 Disabled (enable in .env with SENTRY_POLLING_ENABLED=true)'}`);
 });

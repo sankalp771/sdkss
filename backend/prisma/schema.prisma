@@ -30,13 +30,35 @@ model Component {
   status          String   @default("active") // active, maintenance, deprecated
   fallbackMessage String?  @default("Feature unavailable.")
   crashThreshold  Int?     @default(5)
+  totalCrashCount Int      @default(0) // Lifetime crash count
   createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
 
-  project         Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  processedCrashes ProcessedCrash[]
-  locks           ComponentLock[]
+  project              Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  processedCrashes     ProcessedCrash[]
+  locks                ComponentLock[]
+  versionStats         ComponentVersionStat[]
+  componentErrors      ComponentError[]
 
   @@unique([projectId, identifier])
+  @@index([projectId])
+}
+
+// Track version-specific crash metrics
+model ComponentVersionStat {
+  id            String   @id @default(uuid())
+  componentId   String
+  appVersion    String   // e.g., "1.0.0", "2.1.3"
+  crashCount    Int      @default(0)
+  actionCount   Int      @default(0) // Total action calls
+  lastUpdated   DateTime @updatedAt
+  createdAt     DateTime @default(now())
+
+  component     Component @relation(fields: [componentId], references: [id], onDelete: Cascade)
+
+  @@unique([componentId, appVersion])
+  @@index([componentId])
+  @@index([appVersion])
 }
 
 model ProcessedCrash {
@@ -64,4 +86,43 @@ model ComponentLock {
   createdAt   DateTime @default(now())
 
   component   Component @relation(fields: [componentId], references: [id], onDelete: Cascade)
+}
+
+// Detailed error logging with action tracking
+model ComponentError {
+  id              String   @id @default(uuid())
+  componentId     String
+  projectId       String
+  actionId        String   // Reference to which action triggered the error
+  appVersion      String   // App version when error occurred
+  errorMessage    String
+  stackTrace      String?
+  errorType       String?  // e.g., "NullPointerException", "NetworkError"
+  metadata        Json?    // Additional context
+  isArchived      Boolean  @default(false)
+  archivedAt      DateTime?
+  createdAt       DateTime @default(now())
+
+  component       Component @relation(fields: [componentId], references: [id], onDelete: Cascade)
+
+  @@index([componentId])
+  @@index([projectId])
+  @@index([appVersion])
+  @@index([actionId])
+  @@index([createdAt]) // For archiving queries
+  @@index([isArchived])
+}
+
+// Application utilities/metadata
+model ApplicationUtil {
+  id            String   @id @default(uuid())
+  projectId     String
+  currentAppVersion String  // Current production version
+  minSupportedVersion String // Minimum supported app version
+  metadata      Json?    // Additional app config like flags, feature toggles
+  lastUpdated   DateTime @updatedAt
+  createdAt     DateTime @default(now())
+
+  @@unique([projectId])
+  @@index([projectId])
 }
