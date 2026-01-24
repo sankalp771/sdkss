@@ -3,6 +3,7 @@ const { BigQuery } = require('@google-cloud/bigquery');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const cors = require('cors');
 const { PrismaClient } = require('@prisma/client');
+const axios = require('axios');
 require('dotenv').config();
 
 const app = express();
@@ -346,7 +347,71 @@ app.get('/api/config', (req, res) => {
   });
 });
 
+// --- Sentry Polling Service (Bypasses Ngrok) ---
+const SENTRY_AUTH_TOKEN = "018d1a0ddcdc56b902fbdf1e12463c1df15d45a000291708f8210034cfce04eb";
+const ORG_SLUG = "sankalp-lk"; // Deduced from your screenshots
+const PROJECT_SLUG = "open-safe-box"; // Default Flutter project name seen in screenshot
+
+async function pollSentryIssues() {
+  try {
+    // console.log("🕵️ Polling Sentry for new issues...");
+    const url = `https://sentry.io/api/0/projects/${ORG_SLUG}/${PROJECT_SLUG}/issues/?query=is:unresolved`;
+
+    const response = await axios.get(url, {
+      headers: { Authorization: `Bearer ${SENTRY_AUTH_TOKEN}` }
+    });
+
+    const issues = response.data;
+    // console.log(`   - Found ${issues.length} unresolved issues.`);
+
+    for (const issue of issues) {
+      // Check if we already have this crash
+      const exists = await prisma.processedCrash.findFirst({
+        where: { firebaseEventId: `sentry-${issue.id}` }
+      });
+
+      if (!exists) {
+        console.log(`🔥 New Sentry Issue Found: ${issue.title}`);
+
+        // Import into DB
+        const newCrash = await prisma.processedCrash.create({
+          data: {
+            projectId: "41ed4c1c-683d-4ccc-a526-0d8cb7a015c8",
+            componentId: null,
+            firebaseEventId: `sentry-${issue.id}`,
+            errorMessage: issue.title,
+            stackTrace: issue.culprit, // Sentry provides partial stack in list view
+            analysisStatus: 'pending',
+            geminiAnalysis: { source: "Sentry Poller", link: issue.permalink }
+          }
+        });
+
+        // Analyze
+        analyzeCrashInternal(issue.title, issue.culprit, "Sentry Imported").then(async (analysis) => {
+          await prisma.processedCrash.update({
+            where: { id: newCrash.id },
+            data: { analysisStatus: 'completed', geminiAnalysis: analysis }
+          });
+          console.log(`   ✅ Analyzed & Saved (ID: ${newCrash.id})`);
+        });
+      }
+    }
+
+  } catch (error) {
+    if (error.response?.status === 404) {
+      console.warn("⚠️ Sentry Polling 404: Check Organization/Project Slugs!");
+    } else {
+      console.error("⚠️ Sentry Polling Error:", error.message);
+    }
+  }
+}
+
+// Start Polling Loop (Every 30 Seconds)
+setInterval(pollSentryIssues, 30 * 1000);
+pollSentryIssues(); // Run immediately on start
+
 // Start Server
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
+  console.log(`   - Sentry Poller Active 🟢`);
 });

@@ -22,6 +22,11 @@ async function triggerFakeCrashes() {
         console.log("   - Sending: TypeError (cannot read propery 'user')");
         Sentry.captureException(new TypeError("Cannot read properties of undefined (reading 'user') at HeaderComponent.js:42"));
 
+        // Crash 4: Unique Random Error (Forces Webhook Trigger)
+        const uniqueId = Date.now();
+        console.log(`   - Sending: Hackathon Verification Error #${uniqueId}`);
+        Sentry.captureException(new Error(`HackathonDemoError: The Live Demo Pipeline is REAL [ID: ${uniqueId}]`));
+
     } catch (e) {
         console.error("Failed to send to Sentry:", e);
     } finally {
