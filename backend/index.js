@@ -102,7 +102,7 @@ app.post('/api/sentry-webhook', async (req, res) => {
     console.log(`🚨 Sentry Alert: ${error_message}`);
 
     const crashData = {
-      projectId: "41ed4c1c-683d-4ccc-a526-0d8cb7a015c8",
+      projectId: "6235d428-968d-415a-b985-016ded417547",
       componentId: null,
       firebaseEventId: `sentry-${issue.id}`,
       errorMessage: error_message,
@@ -705,22 +705,57 @@ async function pollSentryIssues() {
     const issues = response.data;
 
     for (const issue of issues) {
-      const exists = await prisma.processedCrash.findFirst({
+      const existingCrash = await prisma.processedCrash.findFirst({
         where: { firebaseEventId: `sentry-${issue.id}` }
       });
 
-      if (!exists) {
+      if (existingCrash) {
+        // Update event count to match Sentry's actual count
+        console.log(`📈 Updating count for Issue: ${issue.title} (Sentry count: ${issue.count})`);
+        await prisma.processedCrash.update({
+          where: { id: existingCrash.id },
+          data: { eventCount: parseInt(issue.count) || existingCrash.eventCount }
+        });
+      } else {
         console.log(`🔥 New Sentry Issue Found: ${issue.title}`);
 
         let fullStackTrace = issue.culprit;
         let actionId = null;
         let componentFile = null;
+        let appVersion = 'unknown';
 
         try {
           // Fetch FULL DETAILS
           const eventUrl = `https://sentry.io/api/0/issues/${issue.id}/events/latest/`;
           const eventRes = await axios.get(eventUrl, { headers: { Authorization: `Bearer ${SENTRY_AUTH_TOKEN}` } });
           const eventData = eventRes.data;
+
+          // Extract App Version from multiple sources
+          if (eventData.release) {
+            appVersion = eventData.release.version || eventData.release;
+          } else if (eventData.tags) {
+            const releaseTag = eventData.tags.find(t => t.key === 'release');
+            if (releaseTag) appVersion = releaseTag.value;
+          }
+
+          // Also check issue-level tags if event-level didn't work
+          if (appVersion === 'unknown' && issue.tags) {
+            const releaseTag = issue.tags.find(t => t.key === 'release');
+            if (releaseTag) appVersion = releaseTag.value;
+          }
+
+          // Format version: "app_name@1.0.0+1" -> "1.0.0 (1)"
+          if (appVersion !== 'unknown') {
+            // Remove package name prefix if present (e.g., "app_to_test_sdk@" -> "")
+            if (appVersion.includes('@')) {
+              appVersion = appVersion.split('@')[1];
+            }
+            // Convert "+" to " (" and add closing ")" (e.g., "1.0.0+1" -> "1.0.0 (1)")
+            if (appVersion.includes('+')) {
+              const parts = appVersion.split('+');
+              appVersion = `${parts[0]} (${parts[1]})`;
+            }
+          }
 
           // 1. Extract Stack Trace (Try multiple paths)
           try {
@@ -813,16 +848,19 @@ async function pollSentryIssues() {
 
         const newCrash = await prisma.processedCrash.create({
           data: {
-            projectId: "41ed4c1c-683d-4ccc-a526-0d8cb7a015c8",
-            componentId: actionId || "unknown_component",
+            projectId: "6235d428-968d-415a-b985-016ded417547",
+            componentId: null,  // Will be linked later if component is identified
             firebaseEventId: `sentry-${issue.id}`,
             errorMessage: issue.title,
             stackTrace: fullStackTrace,
+            eventCount: parseInt(issue.count) || 1,
+            appVersion: appVersion,
             analysisStatus: 'pending',
             geminiAnalysis: {
               source: "Sentry Poller",
               link: issue.permalink,
-              guessedFile: componentFile
+              guessedFile: componentFile,
+              actionId: actionId  // Store for reference
             }
           }
         });

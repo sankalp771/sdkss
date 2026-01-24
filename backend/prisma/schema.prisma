@@ -66,9 +66,10 @@ model ProcessedCrash {
   projectId       String
   componentId     String?
   firebaseEventId String?
-  issueId         String?
   errorMessage    String?
   stackTrace      String?
+  eventCount      Int      @default(1)
+  appVersion      String?
   analysisStatus  String   @default("pending") // pending, analyzing, completed, failed
   geminiAnalysis  Json?
   createdAt       DateTime @default(now())
