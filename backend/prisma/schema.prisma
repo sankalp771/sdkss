@@ -37,29 +37,15 @@ model Component {
   project              Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
   processedCrashes     ProcessedCrash[]
   locks                ComponentLock[]
-  versionStats         ComponentVersionStat[]
+  // versionStats removed
   componentErrors      ComponentError[]
+  appVersion           String?  // Added as per request
 
   @@unique([projectId, identifier])
   @@index([projectId])
 }
 
-// Track version-specific crash metrics
-model ComponentVersionStat {
-  id            String   @id @default(uuid())
-  componentId   String
-  appVersion    String   // e.g., "1.0.0", "2.1.3"
-  crashCount    Int      @default(0)
-  actionCount   Int      @default(0) // Total action calls
-  lastUpdated   DateTime @updatedAt
-  createdAt     DateTime @default(now())
-
-  component     Component @relation(fields: [componentId], references: [id], onDelete: Cascade)
-
-  @@unique([componentId, appVersion])
-  @@index([componentId])
-  @@index([appVersion])
-}
+// ComponentVersionStat model removed as per request
 
 model ProcessedCrash {
   id              String   @id @default(uuid())
@@ -70,6 +56,15 @@ model ProcessedCrash {
   stackTrace      String?
   eventCount      Int      @default(1)
   appVersion      String?
+  
+  // Processing Status (The "CLI" extraction results)
+  fileName        String?
+  errorLine       Int?
+  
+  // Recording Status (New Requirement)
+  isRecorded      Boolean  @default(false)
+  recordedAt      DateTime?
+
   analysisStatus  String   @default("pending") // pending, analyzing, completed, failed
   geminiAnalysis  Json?
   createdAt       DateTime @default(now())
@@ -98,10 +93,13 @@ model ComponentError {
   appVersion      String   // App version when error occurred
   errorMessage    String
   stackTrace      String?
+  eventCount      Int      @default(1) // Added as per request
   errorType       String?  // e.g., "NullPointerException", "NetworkError"
   metadata        Json?    // Additional context
   isArchived      Boolean  @default(false)
   archivedAt      DateTime?
+  isRecorded      Boolean  @default(false) // Added: Track recording status
+  recordedTime    DateTime?               // Added: Timestamp of recording
   createdAt       DateTime @default(now())
 
   component       Component @relation(fields: [componentId], references: [id], onDelete: Cascade)

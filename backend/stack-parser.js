@@ -13,7 +13,12 @@ const SYSTEM_FILES = [
     'platform_dispatcher.dart',
     'pointer_binding.dart',
     'operations.dart',
-    'js_allow_interop_patch.dart'
+    'js_allow_interop_patch.dart',
+    'window.dart',
+    'framework.dart',
+    'component_stat.dart',
+    'view.dart',
+    'binding_wrapper.dart'
 ];
 
 /**

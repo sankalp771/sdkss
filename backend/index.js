@@ -102,7 +102,7 @@ app.post('/api/sentry-webhook', async (req, res) => {
     console.log(`🚨 Sentry Alert: ${error_message}`);
 
     const crashData = {
-      projectId: "6235d428-968d-415a-b985-016ded417547",
+      projectId: "3a40c689-e89f-441c-976d-086e63cc0fc6",
       componentId: null,
       firebaseEventId: `sentry-${issue.id}`,
       errorMessage: error_message,
@@ -847,7 +847,7 @@ async function pollSentryIssues() {
 
         const newCrash = await prisma.processedCrash.create({
           data: {
-            projectId: "6235d428-968d-415a-b985-016ded417547",
+            projectId: "3a40c689-e89f-441c-976d-086e63cc0fc6",
             componentId: null,  // Will be linked later if component is identified
             firebaseEventId: `sentry-${issue.id}`,
             errorMessage: issue.title,
@@ -875,11 +875,12 @@ async function pollSentryIssues() {
           });
           console.log(`   ✅ Analyzed & Saved (ID: ${newCrash.id}, Action: ${actionId})`);
 
-          // Auto-process crash to extract actionId and create ComponentError
-          console.log(`   🔄 Auto-processing crash ${newCrash.id}...`);
-          processCrash(newCrash.id).catch(err => {
-            console.error(`   ⚠️ Auto-processing failed: ${err.message}`);
-          });
+          // Auto-processing DISABLED (Trigger via API instead)
+          // console.log(`   🔄 Auto-processing crash ${newCrash.id}...`);
+          // processCrash(newCrash.id).catch(err => {
+          //   console.error(`   ⚠️ Auto-processing failed: ${err.message}`);
+          // });
+          console.log(`   Waiting for external trigger to process crash ${newCrash.id}`);
         });
       }
     }
@@ -950,6 +951,33 @@ app.post('/api/crashes/:id/fix', async (req, res) => {
     .catch(err => console.error(`   ❌ Fix Error for #${id}:`, err));
 
   res.json({ message: "Fix triggered! Check GitHub PRs shortly." });
+});
+
+const { updateComponentStats, updateAllComponentsStats } = require('./component-stats');
+
+// NEW: Component Stats Sync API
+app.post('/api/components/:id/sync-stats', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await updateComponentStats(id);
+    res.json({ success: true, component: result });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/components/sync-stats', async (req, res) => {
+  try {
+    const results = await updateAllComponentsStats();
+    res.json({
+      success: true,
+      total: results.length,
+      updated: results.filter(r => r.success).length,
+      details: results
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
 // Start Polling Loop (Every 30 Seconds) - only if enabled

@@ -124,7 +124,8 @@ async function processCrash(crashId) {
                     identifier: analysis.actionId,
                     name: analysis.componentId || analysis.actionId,
                     status: 'active',
-                    crashThreshold: 3
+                    crashThreshold: 3,
+                    appVersion: crash.appVersion
                 }
             });
         } else {
@@ -140,6 +141,7 @@ async function processCrash(crashId) {
                 actionId: analysis.actionId,
                 appVersion: crash.appVersion || 'unknown',
                 errorMessage: crash.errorMessage,
+                eventCount: crash.eventCount || 1,
                 errorType: 'runtime_error',
                 stackTrace: crash.stackTrace,
                 metadata: {
