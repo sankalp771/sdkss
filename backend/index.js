@@ -744,16 +744,15 @@ async function pollSentryIssues() {
             if (releaseTag) appVersion = releaseTag.value;
           }
 
-          // Format version: "app_name@1.0.0+1" -> "1.0.0 (1)"
+          // Format version: "app_name@1.0.0+1" -> "1.0.0"
           if (appVersion !== 'unknown') {
             // Remove package name prefix if present (e.g., "app_to_test_sdk@" -> "")
             if (appVersion.includes('@')) {
               appVersion = appVersion.split('@')[1];
             }
-            // Convert "+" to " (" and add closing ")" (e.g., "1.0.0+1" -> "1.0.0 (1)")
+            // Remove build number after "+" (e.g., "1.0.0+1" -> "1.0.0")
             if (appVersion.includes('+')) {
-              const parts = appVersion.split('+');
-              appVersion = `${parts[0]} (${parts[1]})`;
+              appVersion = appVersion.split('+')[0];
             }
           }
 
