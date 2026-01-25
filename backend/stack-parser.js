@@ -18,7 +18,10 @@ const SYSTEM_FILES = [
     'framework.dart',
     'component_stat.dart',
     'view.dart',
-    'binding_wrapper.dart'
+    'component_stat.dart',
+    'view.dart',
+    'binding_wrapper.dart',
+    'frame_service.dart'
 ];
 
 /**

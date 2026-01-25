@@ -25,14 +25,27 @@ async function fetchGitHubFile(filePath, targetLine = null, contextLines = 10) {
 
     try {
         // Normalize file path (ensure it starts with lib/ for Flutter projects)
+        // Normalize file path
         let normalizedPath = filePath;
+
+        // Handle package: URIs (e.g., "package:my_app/main.dart" -> "lib/main.dart")
+        if (normalizedPath.startsWith('package:')) {
+            const parts = normalizedPath.split('/');
+            // Remove 'package:name' part (index 0)
+            if (parts.length > 1) {
+                normalizedPath = parts.slice(1).join('/');
+            }
+        }
+
+        // Ensure lib/ prefix for Dart files if missing (and not test/)
         if (!normalizedPath.startsWith('lib/') && !normalizedPath.startsWith('test/')) {
-            normalizedPath = `lib/${filePath}`;
+            normalizedPath = `lib/${normalizedPath}`;
         }
 
         const url = `https://api.github.com/repos/${GITHUB_REPO_OWNER}/${GITHUB_REPO_NAME}/contents/${normalizedPath}?ref=${GITHUB_BRANCH}`;
 
-        console.log(`📥 Fetching GitHub file: ${normalizedPath}`);
+        console.log(`📥 Fetching GitHub file: "${normalizedPath}"`);
+        console.log(`   URL: ${url}`); // Debug Log
 
         const response = await axios.get(url, {
             headers: {
@@ -111,7 +124,36 @@ async function searchFileInRepo(fileName) {
     }
 }
 
+/**
+ * Search for specific code/text in repository
+ * @param {string} queryText - Text to search for (e.g., function name)
+ * @returns {Array} List of matching file paths
+ */
+async function searchCodeInRepo(queryText) {
+    if (!GITHUB_TOKEN || !queryText || queryText === 'unknown') return [];
+
+    try {
+        console.log(`🔎 Searching repo for code: "${queryText}"...`);
+        const query = `${queryText} repo:${GITHUB_REPO_OWNER}/${GITHUB_REPO_NAME}`;
+        const url = `https://api.github.com/search/code?q=${encodeURIComponent(query)}`;
+
+        const response = await axios.get(url, {
+            headers: {
+                'Authorization': `token ${GITHUB_TOKEN}`,
+                'Accept': 'application/vnd.github.v3+json'
+            }
+        });
+
+        // Return unique file paths
+        return [...new Set(response.data.items.map(item => item.path))];
+    } catch (error) {
+        console.error('GitHub code search error:', error.message);
+        return [];
+    }
+}
+
 module.exports = {
     fetchGitHubFile,
-    searchFileInRepo
+    searchFileInRepo,
+    searchCodeInRepo
 };

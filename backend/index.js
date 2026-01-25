@@ -710,12 +710,19 @@ async function pollSentryIssues() {
       });
 
       if (existingCrash) {
-        // Update event count to match Sentry's actual count
         console.log(`📈 Updating count for Issue: ${issue.title} (Sentry count: ${issue.count})`);
         await prisma.processedCrash.update({
           where: { id: existingCrash.id },
           data: { eventCount: parseInt(issue.count) || existingCrash.eventCount }
         });
+
+        // SELF-HEALING: If it exists but failed/pending (no componentId), RETRY processing!
+        if (!existingCrash.componentId) {
+          console.log(`   ♻️  Retrying processing for existing unlinked crash: ${existingCrash.id}`);
+          processCrash(existingCrash.id).then(result => {
+            if (result.success) console.log(`   ✨ Retry Success: ActionId "${result.actionId}"`);
+          }).catch(e => console.error(`   ⚠️ Retry failed: ${e.message}`));
+        }
       } else {
         console.log(`🔥 New Sentry Issue Found: ${issue.title}`);
 
@@ -786,69 +793,25 @@ async function pollSentryIssues() {
                 return header + frames;
               }).join('\n\n');
 
-              // Try to find file from frames (skip system files)
-              const allFrames = values.flatMap(v => v.stacktrace?.frames || []);
-              // Reverse to look from top of stack down
-              const reversedFrames = [...allFrames].reverse();
-              const systemFiles = ['errors.dart', 'zone.dart', 'isolate_helper.dart', 'future.dart'];
-
-              // 1. Try to find last 'inApp' frame that isn't a system file
-              // (Note: Sentry marks some system files as inside app sometimes in debug builds)
-              let topFrame = reversedFrames.find(f =>
-                f.filename && f.filename.includes('.dart') && !systemFiles.includes(f.filename)
-              );
-
-              // 2. Fallback to any dart file if no user file found
-              if (!topFrame) {
-                topFrame = reversedFrames.find(f => f.filename && f.filename.includes('.dart'));
-              }
-
-              if (topFrame) componentFile = topFrame.filename;
+              console.log(`   📝 Constructed Stack Trace (${fullStackTrace.length} chars)`);
             } else {
               // Path C: Fallback to raw text message if no stack found
               console.log("   ⚠️ No structured stacktrace found in event data. Using raw message.");
               fullStackTrace = `Raw Message: ${eventData.message}\n` + (issue.culprit || '');
             }
           } catch (stackErr) {
-            console.log("   ⚠️ Stack parsing error:", stackErr.message);
-          }
-
-          // 2. Extract Action ID
-          // Strategy A: Tags
-          if (eventData.tags) {
-            const actionTag = eventData.tags.find(t => t.key === 'actionId' || t.key === 'action_id');
-            if (actionTag) actionId = actionTag.value;
-          }
-
-          // Strategy B: Breadcrumbs (Logs)
-          if (!actionId && eventData.entries) {
-            const breadcrumbEntry = eventData.entries.find(e => e.type === 'breadcrumbs');
-            if (breadcrumbEntry && breadcrumbEntry.data && breadcrumbEntry.data.values) {
-              // Look for logs like "[ActionGuard] ... actionId=xyz"
-              // or just any key-value pair in messages
-              for (const b of breadcrumbEntry.data.values) {
-                if (b.message && b.message.includes('actionId=')) {
-                  const match = b.message.match(/actionId=([^|\s]+)/);
-                  if (match) actionId = match[1];
-                }
-              }
-            }
-          }
-
-          // Strategy C: Regex on Stack Trace
-          if (!actionId) {
-            const match = fullStackTrace.match(/actionId:\s*['"](.+?)['"]/);
-            if (match) actionId = match[1];
+            console.log("   ⚠️ Stack construction error:", stackErr.message);
           }
 
         } catch (detailsErr) {
           console.log("   ⚠️ Could not fetch details, using summary.", detailsErr);
         }
 
+        // Create the crash record (Pending Analysis)
         const newCrash = await prisma.processedCrash.create({
           data: {
             projectId: "3a40c689-e89f-441c-976d-086e63cc0fc6",
-            componentId: null,  // Will be linked later if component is identified
+            componentId: null,
             firebaseEventId: `sentry-${issue.id}`,
             errorMessage: issue.title,
             stackTrace: fullStackTrace,
@@ -858,30 +821,28 @@ async function pollSentryIssues() {
             geminiAnalysis: {
               source: "Sentry Poller",
               link: issue.permalink,
-              guessedFile: componentFile,
-              actionId: actionId  // Store for reference
+              automated: true
             }
           }
         });
 
-        analyzeCrashInternal(
-          issue.title,
-          fullStackTrace,
-          `Sentry Imported. ActionID: ${actionId || 'None'}. File: ${componentFile || 'Unknown'}`
-        ).then(async (analysis) => {
-          await prisma.processedCrash.update({
-            where: { id: newCrash.id },
-            data: { analysisStatus: 'completed', geminiAnalysis: analysis }
-          });
-          console.log(`   ✅ Analyzed & Saved (ID: ${newCrash.id}, Action: ${actionId})`);
+        console.log(`   ✅ Saved Crash (ID: ${newCrash.id})`);
 
-          // Auto-processing DISABLED (Trigger via API instead)
-          // console.log(`   🔄 Auto-processing crash ${newCrash.id}...`);
-          // processCrash(newCrash.id).catch(err => {
-          //   console.error(`   ⚠️ Auto-processing failed: ${err.message}`);
-          // });
-          console.log(`   Waiting for external trigger to process crash ${newCrash.id}`);
+        // Auto-process crash immediately
+        console.log(`   🔄 Auto-processing crash ${newCrash.id}...`);
+
+        // Call the main orchestrator (processCrash)
+        // No wait time needed, just fire and forget (or log error)
+        processCrash(newCrash.id).then(result => {
+          if (result.success) {
+            console.log(`   ✨ Processing Success: Found ActionId "${result.actionId}"`);
+          } else {
+            console.log(`   ⚠️ Processing Partial/Failed: ${result.reason}`);
+          }
+        }).catch(err => {
+          console.error(`   ❌ Auto-processing fatal error: ${err.message}`);
         });
+
       }
     }
 
